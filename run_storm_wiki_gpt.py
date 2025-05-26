@@ -1,30 +1,15 @@
-"""
-STORM Wiki pipeline powered by Claude family models and You.com search engine.
-You need to set up the following environment variables to run this script:
-    - ANTHROPIC_API_KEY: Anthropic API key
-    - YDC_API_KEY: You.com API key; BING_SEARCH_API_KEY: Bing Search API key, SERPER_API_KEY: Serper API key, BRAVE_API_KEY: Brave API key, or TAVILY_API_KEY: Tavily API key
-
-Output will be structured as below
-args.output_dir/
-    topic_name/  # topic_name will follow convention of underscore-connected topic name w/o space and slash
-        conversation_log.json           # Log of information-seeking conversation
-        raw_search_results.json         # Raw search results from search engine
-        direct_gen_outline.txt          # Outline directly generated with LLM's parametric knowledge
-        storm_gen_outline.txt           # Outline refined with collected information
-        url_to_info.json                # Sources that are used in the final article
-        storm_gen_article.txt           # Final article generated
-        storm_gen_article_polished.txt  # Polished final article (if args.do_polish_article is True)
-"""
-
 import os
-from argparse import ArgumentParser
+import json
+import shutil
+from pathlib import Path
 
+from argparse import ArgumentParser
 from knowledge_storm import (
     STORMWikiRunnerArguments,
     STORMWikiRunner,
     STORMWikiLMConfigs,
 )
-from knowledge_storm.lm import ClaudeModel
+from knowledge_storm.lm import OpenAIModel, AzureOpenAIModel
 from knowledge_storm.rm import (
     YouRM,
     BingSearch,
@@ -33,38 +18,68 @@ from knowledge_storm.rm import (
     DuckDuckGoSearchRM,
     TavilySearchRM,
     SearXNG,
+    AzureAISearch,
 )
 from knowledge_storm.utils import load_api_key
 
+def slugify(text):
+        return text.strip().lower().replace(" ", "_")
+
+def append_references_to_article(article: str, url_info_path: str) -> str:
+    # 读取 URL 索引信息
+    with open(url_info_path, "r", encoding="utf-8") as f:
+        url_info = json.load(f)
+
+    url_to_index = url_info.get("url_to_unified_index", {})
+    
+    # 将 URL 和索引转换为 (index, url) 形式，并排序
+    sorted_refs = sorted([(idx, url) for url, idx in url_to_index.items()], key=lambda x: x[0])
+
+    # 构建参考文献部分
+    references = ["References：\n"]
+    for idx, url in sorted_refs:
+        references.append(f"[{idx}] {url}")
+
+    # 拼接原文与参考文献
+    return article.rstrip() + "\n\n" + "\n".join(references)
 
 def main(args):
     load_api_key(toml_file_path="secrets.toml")
     lm_configs = STORMWikiLMConfigs()
-    claude_kwargs = {
-        "api_key": os.getenv("ANTHROPIC_API_KEY"),
+    openai_kwargs = {
+        "api_key": os.getenv("OPENAI_API_KEY"),
         "temperature": 1.0,
         "top_p": 0.9,
     }
+
+    ModelClass = (
+        OpenAIModel if os.getenv("OPENAI_API_TYPE") == "openai" else AzureOpenAIModel
+    )
+    # If you are using Azure service, make sure the model name matches your own deployed model name.
+    # The default name here is only used for demonstration and may not match your case.
+    gpt_35_model_name = (
+        "gpt-3.5-turbo" if os.getenv("OPENAI_API_TYPE") == "openai" else "gpt-35-turbo"
+    )
+    gpt_4_model_name = "gpt-4o"
+    if os.getenv("OPENAI_API_TYPE") == "azure":
+        openai_kwargs["api_base"] = os.getenv("AZURE_API_BASE")
+        openai_kwargs["api_version"] = os.getenv("AZURE_API_VERSION")
 
     # STORM is a LM system so different components can be powered by different models.
     # For a good balance between cost and quality, you can choose a cheaper/faster model for conv_simulator_lm
     # which is used to split queries, synthesize answers in the conversation. We recommend using stronger models
     # for outline_gen_lm which is responsible for organizing the collected information, and article_gen_lm
     # which is responsible for generating sections with citations.
-    conv_simulator_lm = ClaudeModel(
-        model="claude-3-haiku-20240307", max_tokens=500, **claude_kwargs
+    conv_simulator_lm = ModelClass(
+        model=gpt_35_model_name, max_tokens=500, **openai_kwargs
     )
-    question_asker_lm = ClaudeModel(
-        model="claude-3-sonnet-20240229", max_tokens=500, **claude_kwargs
+    question_asker_lm = ModelClass(
+        model=gpt_35_model_name, max_tokens=500, **openai_kwargs
     )
-    outline_gen_lm = ClaudeModel(
-        model="claude-3-opus-20240229", max_tokens=400, **claude_kwargs
-    )
-    article_gen_lm = ClaudeModel(
-        model="claude-3-opus-20240229", max_tokens=700, **claude_kwargs
-    )
-    article_polish_lm = ClaudeModel(
-        model="claude-3-opus-20240229", max_tokens=4000, **claude_kwargs
+    outline_gen_lm = ModelClass(model=gpt_4_model_name, max_tokens=400, **openai_kwargs)
+    article_gen_lm = ModelClass(model=gpt_4_model_name, max_tokens=700, **openai_kwargs)
+    article_polish_lm = ModelClass(
+        model=gpt_4_model_name, max_tokens=4000, **openai_kwargs
     )
 
     lm_configs.set_conv_simulator_lm(conv_simulator_lm)
@@ -83,6 +98,7 @@ def main(args):
 
     # STORM is a knowledge curation system which consumes information from the retrieval module.
     # Currently, the information source is the Internet and we use search engine API as the retrieval module.
+
     match args.retriever:
         case "bing":
             rm = BingSearch(
@@ -115,9 +131,14 @@ def main(args):
             rm = SearXNG(
                 searxng_api_key=os.getenv("SEARXNG_API_KEY"), k=engine_args.search_top_k
             )
+        case "azure_ai_search":
+            rm = AzureAISearch(
+                azure_ai_search_api_key=os.getenv("AZURE_AI_SEARCH_API_KEY"),
+                k=engine_args.search_top_k,
+            )
         case _:
             raise ValueError(
-                f'Invalid retriever: {args.retriever}. Choose either "bing", "you", "brave", "duckduckgo", "serper", "tavily", or "searxng"'
+                f'Invalid retriever: {args.retriever}. Choose either "bing", "you", "brave", "duckduckgo", "serper", "tavily", "searxng", or "azure_ai_search"'
             )
 
     runner = STORMWikiRunner(engine_args, lm_configs, rm)
@@ -133,6 +154,30 @@ def main(args):
     runner.post_run()
     runner.summary()
 
+    try:
+        topic_slug = slugify(topic)
+        topic_dir = Path(args.output_dir) / topic_slug
+        article_path = topic_dir / "storm_gen_article_polished.txt"
+        url_info_path = topic_dir / "url_to_info.json"
+        output_path = topic_dir / "final_article_with_refs.txt"
+
+        if not article_path.exists():
+            print(f"找不到文章文件: {article_path}")
+        elif not url_info_path.exists():
+            print(f"找不到参考文献索引文件: {url_info_path}")
+        else:
+            with article_path.open("r", encoding="utf-8") as f:
+                article = f.read()
+
+            final_article = append_references_to_article(article, str(url_info_path))
+            with output_path.open("w", encoding="utf-8") as f:
+                f.write(final_article)
+
+            print(f"已追加参考文献并保存到: {output_path}")
+
+    except Exception as e:
+        print(f"追加参考文献失败: {e}")
+    
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -140,7 +185,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./results/claude",
+        default="./results/gpt",
         help="Directory to store the outputs.",
     )
     parser.add_argument(
@@ -154,7 +199,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--retriever",
         type=str,
-        choices=["bing", "you", "brave", "serper", "duckduckgo", "tavily", "searxng"],
+        choices=[
+            "bing",
+            "you",
+            "brave",
+            "serper",
+            "duckduckgo",
+            "tavily",
+            "searxng",
+            "azure_ai_search",
+        ],
         help="The search engine API to use for retrieving information.",
     )
     # stage of the pipeline
